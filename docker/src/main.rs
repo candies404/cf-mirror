@@ -1,181 +1,332 @@
-use std::collections::HashMap;
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use serde::Deserialize;
 use std::sync::Arc;
-use hyper::{Body, Request, Response, Server, StatusCode};
-use hyper::service::{make_service_fn, service_fn};
-use reqwest::header::{AUTHORIZATION, WWW_AUTHENTICATE};
-use url::Url;
-use serde_json::json;
+use tower_http::trace::TraceLayer;
+use tracing::{debug, info, warn};
 
-static CUSTOM_DOMAIN: &str = "adysec.com";
-static DOCKER_HUB: &str = "https://registry-1.docker.io";
-
-fn routes() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    map.insert(CUSTOM_DOMAIN.to_string(), DOCKER_HUB.to_string());
-    map.insert(format!("docker.{}", CUSTOM_DOMAIN), DOCKER_HUB.to_string());
-    map.insert(format!("quay.{}", CUSTOM_DOMAIN), "https://quay.io".to_string());
-    map.insert(format!("gcr.{}", CUSTOM_DOMAIN), "https://gcr.io".to_string());
-    map.insert(format!("k8s-gcr.{}", CUSTOM_DOMAIN), "https://k8s.gcr.io".to_string());
-    map.insert(format!("k8s.{}", CUSTOM_DOMAIN), "https://registry.k8s.io".to_string());
-    map.insert(format!("ghcr.{}", CUSTOM_DOMAIN), "https://ghcr.io".to_string());
-    map.insert(format!("cloudsmith.{}", CUSTOM_DOMAIN), "https://docker.cloudsmith.io".to_string());
-    map.insert(format!("ecr.{}", CUSTOM_DOMAIN), "https://public.ecr.aws".to_string());
-    map.insert(format!("docker-staging.{}", CUSTOM_DOMAIN), DOCKER_HUB.to_string());
-    map.insert("localhost".to_string(), DOCKER_HUB.to_string());
-    map
+#[derive(Clone)]
+struct AppState {
+    client: reqwest::Client,
+    upstream: String,
+    token_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
-fn route_by_host(host: &str) -> Option<String> {
-    routes().get(host).cloned()
-}
-
-fn response_unauthorized(hostname: &str) -> Response<Body> {
-    let mut res = Response::new(Body::from(json!({"message": "UNAUTHORIZED"}).to_string()));
-    *res.status_mut() = StatusCode::UNAUTHORIZED;
-    res.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        format!(r#"Bearer realm="https://{}/v2/auth",service="cloudflare-docker-proxy""#, hostname)
-            .parse()
-            .unwrap(),
-    );
-    res
-}
-
-fn parse_authenticate(header: &str) -> Option<(String, String)> {
-    let realm_start = header.find(r#"realm=""#)? + 7;
-    let realm_end = header[realm_start..].find('"')? + realm_start;
-    let service_start = header.find(r#"service=""#)? + 9;
-    let service_end = header[service_start..].find('"')? + service_start;
-    Some((header[realm_start..realm_end].to_string(), header[service_start..service_end].to_string()))
-}
-
-async fn fetch_token(
-    client: Arc<reqwest::Client>,
-    www_authenticate: &(String, String),
-    scope: Option<&str>,
-    auth_header: Option<&str>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let mut url = Url::parse(&www_authenticate.0).unwrap();
-    if !www_authenticate.1.is_empty() {
-        url.query_pairs_mut().append_pair("service", &www_authenticate.1);
-    }
-    if let Some(scope) = scope {
-        url.query_pairs_mut().append_pair("scope", scope);
-    }
-    let mut req = client.get(url);
-    if let Some(auth) = auth_header {
-        req = req.header(AUTHORIZATION, auth);
-    }
-    req.send().await
-}
-
-async fn handle_request(client: Arc<reqwest::Client>, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let upstream = match route_by_host(host) {
-        Some(u) => u,
-        None => {
-            let body = serde_json::to_string(&routes()).unwrap();
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from(body))
-                .unwrap());
-        }
-    };
-    let is_dockerhub = upstream == DOCKER_HUB;
-    let auth_header = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
-    let uri_path = req.uri().path().to_string();
-
-    // 根路径重定向
-    if uri_path == "/" {
-        let redirect_url = format!("http://{}/v2/", host);
-        return Ok(Response::builder()
-            .status(StatusCode::MOVED_PERMANENTLY)
-            .header("Location", redirect_url)
-            .body(Body::empty())
-            .unwrap());
-    }
-
-    // /v2/ 请求
-    if uri_path == "/v2/" {
-        let resp = match client.get(format!("{}/v2/", upstream)).headers(req.headers().clone()).send().await {
-            Ok(r) => r,
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from("Upstream request failed"))
-                    .unwrap());
-            }
-        };
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Ok(response_unauthorized(host));
-        }
-        let body_bytes = resp.bytes().await.unwrap_or_default();
-        return Ok(Response::builder().status(status.as_u16()).body(Body::from(body_bytes)).unwrap());
-    }
-
-    // /v2/auth 请求
-    if uri_path == "/v2/auth" {
-        let resp = client.get(format!("{}/v2/", upstream)).send().await.unwrap();
-        let status = resp.status();
-        if status != reqwest::StatusCode::UNAUTHORIZED {
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            return Ok(Response::builder().status(status.as_u16()).body(Body::from(body_bytes)).unwrap());
-        }
-        let www_header = resp.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok());
-        if let Some(www) = www_header {
-            let www_authenticate = parse_authenticate(www).unwrap();
-            let scope = req.uri().query().and_then(|q| q.split('&').find(|kv| kv.starts_with("scope=")).map(|kv| &kv[6..]));
-            let token_resp = fetch_token(client.clone(), &www_authenticate, scope, auth_header).await.unwrap();
-            let token_status = token_resp.status();
-            let body_bytes = token_resp.bytes().await.unwrap_or_default();
-            return Ok(Response::builder().status(token_status.as_u16()).body(Body::from(body_bytes)).unwrap());
-        }
-        return Ok(response_unauthorized(host));
-    }
-
-    // DockerHub library 自动补全
-    if is_dockerhub {
-        let mut parts: Vec<&str> = uri_path.split('/').collect();
-        if parts.len() == 5 {
-            parts.insert(2, "library");
-            let redirect_url = format!("http://{}{}", host, parts.join("/"));
-            return Ok(Response::builder()
-                .status(StatusCode::MOVED_PERMANENTLY)
-                .header("Location", redirect_url)
-                .body(Body::empty())
-                .unwrap());
-        }
-    }
-
-    // 转发其他请求
-    let resp = match client.request(req.method().clone(), format!("{}{}", upstream, uri_path)).headers(req.headers().clone()).send().await {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Upstream request failed"))
-                .unwrap());
-        }
-    };
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Ok(response_unauthorized(host));
-    }
-
-    let body_bytes = resp.bytes().await.unwrap_or_default();
-    Ok(Response::builder().status(status.as_u16()).body(Body::from(body_bytes)).unwrap())
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
-    let client = Arc::new(reqwest::Client::builder().user_agent("docker/20.10").build().unwrap());
-    let make_svc = make_service_fn(move |_conn| {
-        let client = client.clone();
-        async move { Ok::<_, hyper::Error>(service_fn(move |req| handle_request(client.clone(), req))) }
-    });
-    let addr = ([127, 0, 0, 1], 8080).into();
-    println!("Listening on http://{}", addr);
-    Server::bind(&addr).serve(make_svc).await.unwrap();
+    // 初始化日志
+    tracing_subscriber::fmt()
+        .with_env_filter("docker_proxy=debug,tower_http=debug")
+        .init();
+
+    let upstream = std::env::var("UPSTREAM_REGISTRY")
+        .unwrap_or_else(|_| "https://registry-1.docker.io".to_string());
+
+    info!("Using upstream registry: {}", upstream);
+
+    let state = AppState {
+        client: reqwest::Client::builder()
+            .build()
+            .expect("Failed to create HTTP client"),
+        upstream,
+        token_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/v2/", get(handle_version))
+        .route("/v2/*path", get(proxy_request).head(proxy_request))
+        .layer(TraceLayer::new_for_http())
+        .with_state(Arc::new(state));
+
+    let addr = "0.0.0.0:8080";
+    info!("Docker registry proxy listening on {}", addr);
+    info!("Usage: docker pull 127.0.0.1:8080/library/ubuntu:latest");
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind to address");
+
+    axum::serve(listener, app)
+        .await
+        .expect("Failed to start server");
+}
+
+// 处理 /v2/ 版本检查
+async fn handle_version() -> impl IntoResponse {
+    info!("Version check requested");
+    (
+        StatusCode::OK,
+        [("Docker-Distribution-API-Version", "registry/2.0")],
+        "{}",
+    )
+}
+
+// 代理所有其他请求到上游 registry
+async fn proxy_request(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, AppError> {
+    let path = request.uri().path();
+    let query = request.uri().query().unwrap_or("");
+    
+    info!("Proxying request: {} {}", request.method(), path);
+
+    let processed_path = path.to_string();
+
+    // 构建上游 URL
+    let upstream_url = if query.is_empty() {
+        format!("{}{}", state.upstream, processed_path)
+    } else {
+        format!("{}{}?{}", state.upstream, processed_path, query)
+    };
+
+    info!("Upstream URL: {}", upstream_url);
+
+    // 准备请求头
+    let mut headers = build_headers(&request);
+
+    // 提取镜像名称用于 token 获取
+    let image_name = extract_image_name(&processed_path);
+    
+    // 检查是否已有 token
+    let token = state.token_cache.read().await.get(&image_name).cloned();
+    if let Some(ref token_value) = token {
+        debug!("Using cached token for {}", image_name);
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token_value)).unwrap(),
+        );
+    }
+
+    // 发送请求到上游
+    let method = convert_method(request.method());
+    
+    let mut response = state
+        .client
+        .request(method.clone(), &upstream_url)
+        .headers(headers.clone())
+        .send()
+        .await
+        .map_err(|e| {
+            warn!("Failed to proxy request: {}", e);
+            AppError::UpstreamError(e.to_string())
+        })?;
+
+    info!("Upstream response status: {}", response.status());
+
+    // 处理 401 - 需要认证
+    if response.status().as_u16() == 401 {
+        info!("Got 401, attempting to get anonymous token");
+        
+        // 解析 WWW-Authenticate header
+        if let Some(auth_header) = response.headers().get("www-authenticate") {
+            if let Ok(auth_str) = auth_header.to_str() {
+                debug!("WWW-Authenticate: {}", auth_str);
+                
+                // 尝试获取匿名 token
+                if let Ok(new_token) = get_anonymous_token(&state.client, auth_str, &image_name).await {
+                    // 缓存 token
+                    state.token_cache.write().await.insert(image_name.clone(), new_token.clone());
+                    
+                    // 使用新 token 重试
+                    headers.insert(
+                        reqwest::header::AUTHORIZATION,
+                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", new_token)).unwrap(),
+                    );
+                    
+                    response = state
+                        .client
+                        .request(method, &upstream_url)
+                        .headers(headers)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            warn!("Failed to retry request: {}", e);
+                            AppError::UpstreamError(e.to_string())
+                        })?;
+                    
+                    info!("Retry response status: {}", response.status());
+                }
+            }
+        }
+    }
+
+    // 构建响应
+    build_response(response).await
+}
+
+// 构建请求头
+fn build_headers(request: &Request) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in request.headers().iter() {
+        let key_str = key.as_str().to_lowercase();
+        if key_str != "host" && key_str != "connection" && key_str != "content-length" {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_str().as_bytes()) {
+                if let Ok(val) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    headers.insert(name, val);
+                }
+            }
+        }
+    }
+
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("Docker-Client/24.0.0 (linux)"),
+    );
+    
+    headers
+}
+
+// 转换 HTTP 方法
+fn convert_method(method: &axum::http::Method) -> reqwest::Method {
+    match method {
+        &axum::http::Method::GET => reqwest::Method::GET,
+        &axum::http::Method::HEAD => reqwest::Method::HEAD,
+        _ => reqwest::Method::GET,
+    }
+}
+
+// 提取镜像名称
+fn extract_image_name(path: &str) -> String {
+    // 从路径中提取镜像名称，例如 /v2/library/ubuntu/manifests/latest -> library/ubuntu
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() > 3 && parts[1] == "v2" {
+        // 找到 manifests 或 blobs 之前的部分
+        let mut name_parts = Vec::new();
+        for part in parts.iter().skip(2) {
+            if *part == "manifests" || *part == "blobs" || *part == "tags" {
+                break;
+            }
+            name_parts.push(*part);
+        }
+        return name_parts.join("/");
+    }
+    "unknown".to_string()
+}
+
+// 获取匿名 token
+async fn get_anonymous_token(
+    client: &reqwest::Client,
+    auth_header: &str,
+    image_name: &str,
+) -> Result<String, AppError> {
+    // 解析 WWW-Authenticate header
+    // 格式: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/ubuntu:pull"
+    
+    let realm = extract_param(auth_header, "realm");
+    let service = extract_param(auth_header, "service");
+    let scope = format!("repository:{}:pull", image_name);
+    
+    if realm.is_empty() || service.is_empty() {
+        warn!("Failed to parse auth header: {}", auth_header);
+        return Err(AppError::UpstreamError("Invalid auth header".to_string()));
+    }
+    
+    let token_url = format!("{}?service={}&scope={}", 
+        realm.trim_matches('"'),
+        service.trim_matches('"'),
+        urlencoding::encode(&scope)
+    );
+    
+    debug!("Requesting token from: {}", token_url);
+    
+    let response = client
+        .get(&token_url)
+        .send()
+        .await
+        .map_err(|e| AppError::UpstreamError(format!("Token request failed: {}", e)))?;
+    
+    if !response.status().is_success() {
+        warn!("Token request failed with status: {}", response.status());
+        return Err(AppError::UpstreamError("Token request failed".to_string()));
+    }
+    
+    let token_resp: TokenResponse = response
+        .json()
+        .await
+        .map_err(|e| AppError::UpstreamError(format!("Token parse failed: {}", e)))?;
+    
+    let token = token_resp.token.or(token_resp.access_token)
+        .ok_or_else(|| AppError::UpstreamError("No token in response".to_string()))?;
+    
+    info!("Successfully obtained anonymous token for {}", image_name);
+    Ok(token)
+}
+
+// 从认证头中提取参数
+fn extract_param(auth_header: &str, param: &str) -> String {
+    let param_prefix = format!("{}=", param);
+    if let Some(start) = auth_header.find(&param_prefix) {
+        let value_start = start + param_prefix.len();
+        let rest = &auth_header[value_start..];
+        
+        // 处理引号包围的值
+        if rest.starts_with('"') {
+            if let Some(end) = rest[1..].find('"') {
+                return rest[1..end + 1].to_string();
+            }
+        } else {
+            // 没有引号，找到逗号或结尾
+            if let Some(end) = rest.find(',') {
+                return rest[..end].to_string();
+            } else {
+                return rest.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+// 构建响应
+async fn build_response(response: reqwest::Response) -> Result<Response, AppError> {
+    let status_code = response.status().as_u16();
+    let status = StatusCode::from_u16(status_code)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    let mut response_builder = Response::builder().status(status);
+    
+    for (key, value) in response.headers().iter() {
+        let key_str = key.as_str().to_lowercase();
+        if key_str != "transfer-encoding" && key_str != "connection" {
+            if let Ok(header_name) = axum::http::HeaderName::from_bytes(key.as_str().as_bytes()) {
+                if let Ok(header_value) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
+                    response_builder = response_builder.header(header_name, header_value);
+                }
+            }
+        }
+    }
+
+    let stream = response.bytes_stream();
+    let body = Body::from_stream(stream);
+
+    Ok(response_builder.body(body).unwrap())
+}
+
+// 错误处理
+#[derive(Debug)]
+enum AppError {
+    UpstreamError(String),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            AppError::UpstreamError(msg) => (StatusCode::BAD_GATEWAY, msg),
+        };
+
+        (status, message).into_response()
+    }
 }
 
